@@ -1056,8 +1056,64 @@ function lsMigrateV1(){
 function localDump(){
   const m=lsMeta(); const years={};
   for(const y of m.years){ const b=lsBook(y); if(b) years[y]=b; }
-  return {app:'school-accounting', v:2, savedAt:new Date().toISOString(), current:m.current, years};
+  const cur=years[m.current] || years[m.years[m.years.length-1]] || null;
+  const out={app:'school-accounting', v:2, savedAt:new Date().toISOString(), current:m.current, years};
+  // ใส่ปีปัจจุบันไว้ที่ระดับบนด้วย เพื่อให้โปรแกรมรุ่นเก่าที่อ่านได้เฉพาะปีเดียวยังนำเข้าไฟล์นี้ได้
+  if(cur){ out.cfg=cur.cfg; out.batches=cur.batches; }
+  return out;
 }
+/** อ่านไฟล์สำรองให้เป็นรูปแบบเดียวกัน รองรับทั้งไฟล์รุ่นเก่า (ปีเดียว) และรุ่นใหม่ (หลายปี)
+ *  คืน {years:{fy:{cfg,batches}}, list:[fy...], current} หรือ null ถ้าไม่ใช่ไฟล์ของระบบ */
+function parseBackup(j){
+  if(!j || typeof j!=='object') return null;
+  if(j.years && typeof j.years==='object' && !Array.isArray(j.years)){
+    const years={}; const list=[];
+    for(const k of Object.keys(j.years)){
+      const fy=Number(k), y=j.years[k];
+      if(!fy || !y || !y.cfg) continue;
+      years[fy]={cfg:y.cfg, batches:Array.isArray(y.batches)? y.batches : []};
+      list.push(fy);
+    }
+    if(!list.length) return null;
+    list.sort((a,b)=>a-b);
+    return {years, list, current: (list.includes(Number(j.current))? Number(j.current) : list[list.length-1])};
+  }
+  if(j.cfg && typeof j.cfg==='object'){
+    const fy=Number(j.cfg.fy)||Number(SEED.cfg.fy);
+    return {years:{[fy]:{cfg:j.cfg, batches:Array.isArray(j.batches)? j.batches : []}}, list:[fy], current:fy};
+  }
+  return null;
+}
+function backupSummary(p){
+  return p.list.map(y=>`ปี ${y} — ${(p.years[y].batches||[]).length} ครั้งที่บันทึก`).join('<br>');
+}
+/** นำข้อมูลจากไฟล์สำรองเข้าระบบ ใช้ได้ทั้งโหมดเครื่องและโหมดออนไลน์ */
+async function importBackup(p, onProg){
+  if(!S.db){
+    localRestore({v:2, current:p.current, years:p.years});
+    S.years=lsMeta().years.slice();
+    await loadYear(p.current);
+    S.mode='local';
+    await persistLocal();
+    onProg&&onProg(1,1);
+    return true;
+  }
+  let n=0; const total=p.list.reduce((t,y)=>t+1+(p.years[y].batches||[]).length,0);
+  for(const y of p.list){
+    const cfg=normCfg(JSON.parse(JSON.stringify(p.years[y].cfg)));
+    cfg.fy=y;
+    const batches=(p.years[y].batches||[]).map(b=>normBatch(JSON.parse(JSON.stringify(b))));
+    const old=await S.db.collection(FYK(y)+'/batches').limit(1000).get();
+    for(const d of old.docs){ if(!batches.find(b=>bId(b.no)===d.id)) await S.db.doc(FYK(y)+'/batches/'+d.id).delete(); }
+    await writeYear(cfg, batches);
+    n+=1+batches.length; onProg&&onProg(n,total);
+  }
+  S.years=await listYears();
+  await loadYear(p.current);
+  S.mode='cloud';
+  return true;
+}
+
 /** รับได้ทั้งรูปแบบเก่า (ปีเดียว) และรูปแบบใหม่ (หลายปี) */
 function localRestore(d){
   if(d && d.cfg && !d.years){
@@ -1202,6 +1258,7 @@ async function loadYear(fy){
     S.batches=snap.docs.map(d=>normBatch(JSON.parse(JSON.stringify(d.data()))));
   }
   S.year=fy; setPrefYear(fy);
+  if(!S.db){ const m=lsMeta(); if(m.current!==fy){ m.current=fy; lsSetMeta(m); } }
   if(migrateCfg(S.cfg)){ await (S.db? saveCfg() : persistLocal()); }
   return true;
 }
@@ -2432,7 +2489,9 @@ RENDER.data = () => {
 
   drawStoreBox();
   const backup=()=> S.db
-    ? JSON.stringify({app:'school-accounting',v:1,exportedAt:new Date().toISOString(),cfg:S.cfg,batches:S.batches},null,1)
+    ? JSON.stringify({app:'school-accounting', v:2, exportedAt:new Date().toISOString(),
+        current:Number(S.cfg.fy), years:{[Number(S.cfg.fy)]:{cfg:S.cfg, batches:S.batches}},
+        cfg:S.cfg, batches:S.batches}, null, 1)   /* ใส่ cfg/batches ไว้ด้วย เพื่อให้โปรแกรมรุ่นเก่าอ่านได้ */
     : JSON.stringify(localDump(),null,1);
   const csv=()=>{
     const rows=[['ครั้งที่','วันที่','ลำดับ','อักษรย่อ','เล่มที่/เลขที่','รายการ','รหัสบัญชี','ประเภทบัญชี','รับ','จ่าย','เงินสด','เงินฝากส่วนราชการ','สัญญายืมเงิน']];
@@ -2446,12 +2505,14 @@ RENDER.data = () => {
   $('#fileIn').onchange=async e=>{
     const f=e.target.files[0]; if(!f) return;
     try{
-      const j=JSON.parse(await f.text());
-      if(!j.cfg||!j.batches) throw new Error('ไฟล์นี้ไม่ใช่ไฟล์สำรองของระบบ');
+      const txt=await f.text();
+      let j; try{ j=JSON.parse(txt); }catch(_){ throw new Error('ไฟล์นี้ไม่ใช่ไฟล์ JSON ที่อ่านได้'); }
+      const p=parseBackup(j);
+      if(!p) throw new Error('ไม่พบข้อมูลบัญชีในไฟล์นี้ กรุณาเลือกไฟล์สำรองที่ได้จากปุ่ม “ดาวน์โหลดสำรองทั้งหมด”');
       if(!await confirmBox('นำเข้าไฟล์สำรอง',
-        `จะทับข้อมูลปัจจุบันด้วย <b>${j.batches.length} ครั้งที่บันทึก</b> จากไฟล์ <b>${esc(f.name)}</b><br>ควรดาวน์โหลดสำรองปัจจุบันไว้ก่อน`,'นำเข้า')) return;
-      await writeAll(normCfg(j.cfg), j.batches.map(normBatch));
-      toast('นำเข้าเรียบร้อย'); render();
+        `จากไฟล์ <b>${esc(f.name)}</b><br>${backupSummary(p)}<br><br>ข้อมูลปีเหล่านี้ในระบบจะถูกแทนที่ทั้งหมด ควรดาวน์โหลดสำรองปัจจุบันไว้ก่อน`,'นำเข้า')) return;
+      await importBackup(p);
+      paintShell(); toast('นำเข้าเรียบร้อย'); render();
     }catch(err){ toast('นำเข้าไม่สำเร็จ: '+err.message,true); }
     e.target.value='';
   };
@@ -2580,9 +2641,15 @@ function renderSetup(){
   $('#setupFile').onchange=async e=>{
     const f=e.target.files[0]; if(!f) return;
     try{
-      const j=JSON.parse(await f.text());
-      if(!j.cfg || !j.batches) throw new Error('ไฟล์นี้ไม่ใช่ไฟล์สำรองของระบบ');
-      await run(normCfg(j.cfg), j.batches.map(normBatch));
+      const txt=await f.text();
+      let j; try{ j=JSON.parse(txt); }catch(_){ throw new Error('ไฟล์นี้ไม่ใช่ไฟล์ JSON ที่อ่านได้'); }
+      const p=parseBackup(j);
+      if(!p) throw new Error('ไม่พบข้อมูลบัญชีในไฟล์นี้ กรุณาเลือกไฟล์สำรองที่ได้จากปุ่ม “ดาวน์โหลดสำรองทั้งหมด”');
+      $('#setupBar').style.display='block';
+      $('#setupTxt').textContent='กำลังนำเข้า '+p.list.map(y=>'ปี '+y).join(', ')+' …';
+      const ok=await importBackup(p,(n,t)=>{ $('#setupFill').style.width=(n/t*100).toFixed(1)+'%';
+        $('#setupTxt').textContent=`นำเข้าแล้ว ${n} / ${t}`; });
+      if(ok) location.reload();
     }catch(err){ toast('นำเข้าไม่สำเร็จ: '+err.message,true); }
     e.target.value='';
   };
