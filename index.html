@@ -2653,13 +2653,24 @@ async function drawStoreBox(){
   const bo=$('#fOpen');  if(bo) bo.onclick=async()=>{
     if(!await fileConnect(false)) return;
     const d=await fileRead();
-    if(d && d.cfg){
+    const q=d? parseBackup(d) : null;
+    if(q){
       if(!await confirmBox('เปิดไฟล์ข้อมูล',
-        `ไฟล์นี้มี <b>${(d.batches||[]).length} ครั้งที่บันทึก</b> จะใช้ข้อมูลในไฟล์แทนข้อมูลปัจจุบันหรือไม่`,'ใช้ข้อมูลจากไฟล์')) return;
-      S.cfg=normCfg(d.cfg); S.batches=(d.batches||[]).map(normBatch); migrateCfg(S.cfg);
-      await persistLocal(); toast('เปิดไฟล์ข้อมูลแล้ว');
-    }else{ await persistLocal(); toast('ไฟล์ว่าง จึงบันทึกข้อมูลปัจจุบันลงไฟล์นี้'); }
-    render();
+        `ไฟล์นี้มี<br>${backupSummary(q)}<br><br>จะใช้ข้อมูลในไฟล์นี้แทนข้อมูลในเครื่องนี้หรือไม่`,'ใช้ข้อมูลจากไฟล์')) return;
+      localRestore({v:2, current:q.current, years:q.years});
+      S.years=lsMeta().years.slice();
+      await loadYear(q.current);
+      await persistLocal();
+      toast('เปิดไฟล์ข้อมูลแล้ว');
+    }else{
+      if(!await confirmBox('ไฟล์นี้ยังไม่มีข้อมูลบัญชี',
+        `อ่านไฟล์แล้วไม่พบข้อมูลบัญชีอยู่ข้างใน<br><br>ถ้าเป็นไฟล์ใหม่ที่ต้องการใช้เก็บข้อมูล กด “บันทึกลงไฟล์นี้” ได้เลย<br>
+         แต่ถ้าไฟล์นี้ควรมีข้อมูลอยู่แล้ว กรุณากดยกเลิกแล้วตรวจว่าเลือกไฟล์ถูกตัวหรือไม่ — ระบบจะไม่เขียนทับไฟล์ที่อ่านไม่ออก`,
+        'บันทึกลงไฟล์นี้')){ await fileForget(); render(); return; }
+      S.fileStamp=null;
+      await persistLocal(); toast('บันทึกข้อมูลของเครื่องนี้ลงไฟล์แล้ว');
+    }
+    paintShell(); render();
   };
   const bg=$('#fGrant');  if(bg) bg.onclick=async()=>{ if(await fileGrant()){ await persistLocal(); toast('อนุญาตแล้ว'); render(); } };
   const bc=$('#fCheck');  if(bc) bc.onclick=async()=>{
@@ -2767,8 +2778,15 @@ function renderSetup(){
   if(bo) bo.onclick=async()=>{
     if(!await fileConnect(false)) return;
     const d=await fileRead();
-    if(d && d.cfg) await run(normCfg(d.cfg), (d.batches||[]).map(normBatch));
-    else toast('ไฟล์นี้ยังไม่มีข้อมูลบัญชี',true);
+    const q=d? parseBackup(d) : null;
+    if(!q){
+      toast('อ่านไฟล์แล้วไม่พบข้อมูลบัญชีข้างใน กรุณาตรวจว่าเลือกไฟล์ถูกตัวหรือไม่',true);
+      await fileForget(); return;
+    }
+    $('#setupBar').style.display='block';
+    $('#setupTxt').textContent='กำลังเปิด '+q.list.map(y=>'ปี '+y).join(', ')+' …';
+    localRestore({v:2, current:q.current, years:q.years});
+    location.reload();
   };
   $('#doBlank').onclick=async()=>{
     if(!await confirmBox('เริ่มจากศูนย์','จะได้ระบบเปล่าที่ยังไม่มีผังบัญชีและรายการใด ๆ ต้องตั้งค่าเองทั้งหมด','เริ่มจากศูนย์')) return;
