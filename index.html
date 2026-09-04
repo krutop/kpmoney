@@ -163,6 +163,13 @@ tr.tot td{background:var(--surface-2);font-weight:600;border-top:1px solid var(-
 .bankbar i{display:block;height:100%;background:var(--accent)}
 
 .empty{padding:40px 20px;text-align:center;color:var(--ink-3)}
+#fileBar{margin:14px 28px 0;border:1px solid var(--warn);background:var(--warn-soft);color:var(--warn);
+  padding:10px 14px;font-size:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+#fileBar b{font-weight:700}
+#fileBar .sp{flex:1;min-width:10px}
+#fileBar button{border-color:var(--warn);color:var(--warn);background:transparent}
+#fileBar button:hover{background:rgba(0,0,0,.06)}
+@media(max-width:860px){#fileBar{margin:12px 16px 0}}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
 #toast div{background:var(--spine);color:var(--spine-ink);padding:9px 18px;font-size:14px;border:1px solid var(--spine-hi);max-width:80vw}
 #toast div.bad{background:var(--crit);color:#fff;border-color:var(--crit)}
@@ -284,6 +291,7 @@ dialog .ft{padding:12px 18px;border-top:1px solid var(--rule);display:flex;gap:8
       <div class="sp"></div>
       <div class="row" id="pgActions"></div>
     </div>
+    <div id="fileBar" class="noprint" style="display:none"></div>
     <div class="page" id="page"></div>
   </main>
 </div>
@@ -1023,6 +1031,21 @@ function confirmBox(title,html,okLabel){
      local : เปิดไฟล์โปรแกรมจากคอมพิวเตอร์ เก็บในเครื่องนี้
              และเขียนลงไฟล์ข้อมูลที่ผู้ใช้เลือกไว้ด้วย ถ้าเบราว์เซอร์รองรับ
    ============================================================ */
+/* ---------- ชื่อเครื่อง ใช้บอกว่าใครเป็นคนบันทึกล่าสุดในไฟล์ร่วม ---------- */
+function deviceId(){
+  try{ let v=localStorage.getItem('schoolacct.device.id');
+    if(!v){ v='d'+Math.random().toString(36).slice(2,8)+Date.now().toString(36).slice(-4);
+      localStorage.setItem('schoolacct.device.id',v); }
+    return v; }catch(e){ return 'd0'; }
+}
+function deviceName(){ try{ return localStorage.getItem('schoolacct.device.name')||''; }catch(e){ return ''; } }
+function setDeviceName(n){ try{ localStorage.setItem('schoolacct.device.name',String(n||'')); }catch(e){} }
+function deviceLabel(d){
+  if(!d) return 'เครื่องอื่น';
+  if(d.id===deviceId()) return (d.name||'เครื่องนี้')+' (เครื่องนี้)';
+  return d.name || 'เครื่องอื่น';
+}
+
 const LSM='schoolacct.meta';       // {years:[2569,2570], current:2570}
 const LSB='schoolacct.book.';      // schoolacct.book.2569 = {cfg,batches}
 function lsMeta(){ try{ const m=JSON.parse(localStorage.getItem(LSM)); return (m&&Array.isArray(m.years))?m:{years:[],current:null}; }
@@ -1126,7 +1149,11 @@ function localRestore(d){
   lsSetMeta({years:ys, current:Number(d.current)||ys[ys.length-1]});
   return true;
 }
-function snapshot(){ return localDump(); }
+function snapshot(){
+  const d=localDump();
+  d.savedBy={id:deviceId(), name:deviceName()};
+  return d;
+}
 
 /* ---------- ไฟล์ข้อมูลในเครื่อง (Chrome / Edge) ---------- */
 let FH=null;
@@ -1165,19 +1192,58 @@ async function fileRead(){
     const perm=await h.queryPermission({mode:'readwrite'});
     if(perm!=='granted'){ S.fileNeedsPermission=true; return null; }
     const t=await (await h.getFile()).text();
-    if(!t.trim()) return null;
+    if(!t.trim()){ S.fileStamp=null; return null; }
     const j=JSON.parse(t);
-    return (j && j.cfg && j.batches)? j : null;
+    if(!j || (!j.years && !j.cfg)) return null;
+    S.fileStamp = j.savedAt || null;
+    S.fileBy = j.savedBy || null;
+    S.fileStale = null;
+    return j;
   }catch(e){ return null; }
 }
-async function fileWrite(){
+/** อ่านเฉพาะเวลาบันทึกล่าสุดของไฟล์ เพื่อดูว่ามีใครแก้ไปหรือยัง */
+async function filePeek(){
+  if(!fsaOK()) return null;
+  const h=await fileHandle(); if(!h) return null;
+  try{
+    if((await h.queryPermission({mode:'readwrite'}))!=='granted'){ S.fileNeedsPermission=true; return null; }
+    const t=await (await h.getFile()).text();
+    if(!t.trim()) return null;
+    const j=JSON.parse(t);
+    return {savedAt:j.savedAt||null, savedBy:j.savedBy||null};
+  }catch(e){ return null; }
+}
+/** ตรวจว่าไฟล์ร่วมถูกแก้จากเครื่องอื่นหรือไม่ */
+async function checkFileFresh(){
+  if(S.db || !(await fileHandle())) return null;
+  const p=await filePeek();
+  if(!p) return null;
+  if(S.fileStamp && p.savedAt && p.savedAt!==S.fileStamp){
+    S.fileStale={savedAt:p.savedAt, savedBy:p.savedBy};
+  }else S.fileStale=null;
+  return S.fileStale;
+}
+/** เขียนลงไฟล์ร่วม — ตรวจก่อนว่ามีใครแก้ไฟล์หลังจากที่เราอ่านมาหรือไม่
+ *  คืน true = สำเร็จ, false = ไม่ได้เขียน, 'conflict' = ไฟล์ถูกแก้จากเครื่องอื่น */
+async function fileWrite(force){
   if(!fsaOK()) return false;
   const h=await fileHandle(); if(!h) return false;
   try{
     if((await h.queryPermission({mode:'readwrite'}))!=='granted'){ S.fileNeedsPermission=true; return false; }
+    if(!force){
+      const p=await filePeek();
+      if(p && p.savedAt && S.fileStamp && p.savedAt!==S.fileStamp){
+        S.fileStale={savedAt:p.savedAt, savedBy:p.savedBy};
+        return 'conflict';
+      }
+    }
+    const payload=snapshot();
     const w=await h.createWritable();
-    await w.write(JSON.stringify(snapshot(),null,1));
-    await w.close(); S.fileNeedsPermission=false; return true;
+    await w.write(JSON.stringify(payload,null,1));
+    await w.close();
+    S.fileStamp=payload.savedAt; S.fileBy=payload.savedBy;
+    S.fileStale=null; S.fileNeedsPermission=false;
+    return true;
   }catch(e){ return false; }
 }
 async function fileGrant(){
@@ -1193,8 +1259,30 @@ async function persistLocal(){
   const fy=Number(S.cfg&&S.cfg.fy);
   let ok=true;
   if(fy){ ok=lsPutBook(fy,{cfg:S.cfg,batches:S.batches}); lsRegisterYear(fy,true); }
-  S.fileSaved = await fileWrite();
+  const r=await fileWrite();
+  if(r==='conflict'){
+    const st=S.fileStale||{};
+    const forceIt=await confirmBox('ไฟล์ข้อมูลถูกแก้จากเครื่องอื่น',
+      `ไฟล์ข้อมูลร่วมถูกบันทึกโดย <b>${esc(deviceLabel(st.savedBy))}</b> เมื่อ ${esc(thDate((st.savedAt||'').slice(0,10)))} ${esc((st.savedAt||'').slice(11,16))} น. หลังจากที่เครื่องนี้เปิดข้อมูลมา<br><br>
+       ถ้าเขียนทับ งานที่เครื่องนั้นเพิ่งบันทึกจะหายไป<br>
+       ถ้ายังไม่เขียนทับ ข้อมูลที่เพิ่งกรอกยังอยู่ในเครื่องนี้ ให้ไปที่ <b>ข้อมูลและสำรอง</b> ดาวน์โหลดสำรองเก็บไว้ก่อน แล้วค่อยตัดสินใจ`,
+      'เขียนทับด้วยข้อมูลเครื่องนี้');
+    if(forceIt){ S.fileSaved = (await fileWrite(true))===true; }
+    else { S.fileSaved=false; toast('ยังไม่ได้เขียนลงไฟล์ร่วม ข้อมูลอยู่ในเครื่องนี้เท่านั้น',true); }
+  } else S.fileSaved = (r===true);
   return ok;
+}
+/** ดึงข้อมูลล่าสุดจากไฟล์ร่วมมาใช้ */
+async function reloadFromFile(){
+  const d=await fileRead();
+  if(!d){ toast('อ่านไฟล์ข้อมูลไม่สำเร็จ',true); return false; }
+  const p=parseBackup(d);
+  if(!p){ toast('ไฟล์ข้อมูลไม่มีข้อมูลบัญชี',true); return false; }
+  localRestore({v:2, current:p.current, years:p.years});
+  S.years=lsMeta().years.slice();
+  await loadYear((S.years.includes(Number(S.cfg&&S.cfg.fy))? Number(S.cfg.fy) : p.current));
+  S.fileStale=null;
+  return true;
 }
 
 const FYK = (fy)=> 'books/'+(fy || (S.cfg? S.cfg.fy : SEED.cfg.fy));
@@ -1517,6 +1605,7 @@ function render(){
   $$('#nav a').forEach(a=>a.classList.toggle('on',a.dataset.v===id));
   $('#pgActions').innerHTML=''; $('#pgSub').textContent='';
   const p=$('#page'); p.onchange=null; p.oninput=null;
+  paintFileBar();
   const fn=RENDER[id]||RENDER.home;
   try{ fn(q); }catch(e){ console.error(e); $('#page').innerHTML=`<div class="alert e"><b>เกิดข้อผิดพลาดในการแสดงผล</b><br>${esc(e.message)}</div>`; }
   window.scrollTo(0,0);
@@ -2534,19 +2623,32 @@ async function drawStoreBox(){
   }
   const h=await fileHandle();
   const supported=fsaOK();
+  const stamp = S.fileStamp ? `${thDate(S.fileStamp.slice(0,10))} ${S.fileStamp.slice(11,16)} น.` : '—';
   box.innerHTML=`
     <p class="muted" style="margin-top:0">ข้อมูลถูกเก็บไว้ในเบราว์เซอร์ของคอมพิวเตอร์เครื่องนี้ ใช้งานได้แม้ไม่มีอินเทอร์เน็ต และไม่มีใครเห็นข้อมูลนอกจากคนที่ใช้เครื่องนี้</p>
-    ${h ? `<div class="alert g"><b>เชื่อมกับไฟล์ข้อมูลแล้ว</b> — ${esc(h.name||'ไฟล์ข้อมูล')}
-            ${S.fileNeedsPermission?'<br><b style="color:var(--crit)">ต้องอนุญาตให้เขียนไฟล์อีกครั้ง</b> เบราว์เซอร์ขอสิทธิ์ใหม่ทุกครั้งที่เปิดโปรแกรม':'ทุกครั้งที่บันทึก ระบบจะเขียนลงไฟล์นี้ให้อัตโนมัติ'}</div>`
+    ${h ? `<div class="alert ${S.fileNeedsPermission?'e':(S.fileStale?'w':'g')}">
+            <b>เชื่อมกับไฟล์ข้อมูลแล้ว</b> — ${esc(h.name||'ไฟล์ข้อมูล')}
+            <div style="font-size:13px;margin-top:3px">บันทึกลงไฟล์ล่าสุด ${esc(stamp)}
+              ${S.fileBy?' โดย '+esc(deviceLabel(S.fileBy)):''}</div>
+            ${S.fileNeedsPermission?'<div style="margin-top:5px"><b>ต้องอนุญาตให้เขียนไฟล์อีกครั้ง</b> เบราว์เซอร์ขอสิทธิ์ใหม่ทุกครั้งที่เปิดโปรแกรม</div>':''}
+            ${S.fileStale?'<div style="margin-top:5px"><b>มีการแก้ไขจากเครื่องอื่นหลังจากที่เครื่องนี้เปิดข้อมูล</b> ควรกดโหลดข้อมูลล่าสุดก่อนบันทึกอะไรเพิ่ม</div>':''}</div>`
         : `<div class="alert w"><b>ยังไม่ได้เชื่อมไฟล์ข้อมูล</b> — ตอนนี้ข้อมูลอยู่ในเบราว์เซอร์อย่างเดียว
             ถ้าล้างข้อมูลการท่องเว็บ ข้อมูลบัญชีจะหายไปด้วย แนะนำให้เชื่อมกับไฟล์ในเครื่องเพื่อความปลอดภัย</div>`}
     <div class="row">
       ${supported?`<button id="fNew" class="primary">${h?'เปลี่ยนไฟล์ข้อมูล':'สร้างไฟล์ข้อมูลในเครื่อง'}</button>
       <button id="fOpen">เปิดไฟล์ข้อมูลที่มีอยู่</button>
+      ${h?'<button id="fCheck">ตรวจไฟล์เดี๋ยวนี้</button><button id="fPull">โหลดข้อมูลล่าสุดจากไฟล์</button>':''}
       ${S.fileNeedsPermission?'<button id="fGrant" class="primary">อนุญาตให้เขียนไฟล์</button>':''}
       ${h?'<button id="fForget" class="danger">เลิกเชื่อมไฟล์</button>':''}`
       :`<span class="muted">เบราว์เซอร์นี้ยังไม่รองรับการเชื่อมไฟล์ข้อมูลโดยตรง ให้ใช้ปุ่มดาวน์โหลดสำรองด้านล่างแทน หรือเปิดโปรแกรมด้วย Google Chrome หรือ Microsoft Edge</span>`}
-    </div>`;
+    </div>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--rule)">
+      <label class="f" style="max-width:340px"><span>ชื่อเครื่องนี้ (ใช้บอกว่าใครบันทึกล่าสุดในไฟล์ร่วม)</span>
+        <input type="text" id="devName" value="${esc(deviceName())}" placeholder="เช่น เครื่องห้องการเงิน"></label>
+    </div>
+    ${h?`<div class="alert" style="margin-bottom:0"><b>ใช้ไฟล์ร่วมกันหลายเครื่อง</b> — วางไฟล์นี้ไว้ในโฟลเดอร์ที่ทุกเครื่องเห็น เช่น OneDrive, Google Drive หรือโฟลเดอร์แชร์ของโรงเรียน
+      แล้วที่แต่ละเครื่องกด “เปิดไฟล์ข้อมูลที่มีอยู่” ชี้มาที่ไฟล์เดียวกัน<br>
+      ระบบจะตรวจให้อัตโนมัติทุกครั้งที่กลับมาที่หน้าต่างนี้ ถ้ามีคนอื่นแก้ไฟล์ไปแล้วจะขึ้นแถบเตือนด้านบน และจะไม่เขียนทับงานของเขาโดยไม่ถามก่อน</div>`:''}`;
   const bn=$('#fNew');   if(bn) bn.onclick=async()=>{ if(await fileConnect(true)){ await persistLocal(); toast('เชื่อมไฟล์ข้อมูลแล้ว'); render(); } };
   const bo=$('#fOpen');  if(bo) bo.onclick=async()=>{
     if(!await fileConnect(false)) return;
@@ -2560,6 +2662,14 @@ async function drawStoreBox(){
     render();
   };
   const bg=$('#fGrant');  if(bg) bg.onclick=async()=>{ if(await fileGrant()){ await persistLocal(); toast('อนุญาตแล้ว'); render(); } };
+  const bc=$('#fCheck');  if(bc) bc.onclick=async()=>{
+    const st=await checkFileFresh(); paintFileBar();
+    toast(st? 'ไฟล์ถูกแก้จากเครื่องอื่น ควรกดโหลดข้อมูลล่าสุด' : 'ไฟล์ตรงกับข้อมูลในเครื่องนี้'); render(); };
+  const bp=$('#fPull');   if(bp) bp.onclick=async()=>{
+    if(!await confirmBox('โหลดข้อมูลล่าสุดจากไฟล์',
+      'ข้อมูลในเครื่องนี้จะถูกแทนที่ด้วยข้อมูลในไฟล์ทั้งหมด ถ้าเพิ่งบันทึกอะไรที่ยังไม่ได้เขียนลงไฟล์ ควรดาวน์โหลดสำรองเก็บไว้ก่อน','โหลดจากไฟล์')) return;
+    if(await reloadFromFile()){ toast('โหลดข้อมูลล่าสุดแล้ว'); paintShell(); paintFileBar(); render(); } };
+  const dn=$('#devName'); if(dn) dn.onchange=async()=>{ setDeviceName(dn.value.trim()); toast('ตั้งชื่อเครื่องแล้ว'); };
   const bf=$('#fForget'); if(bf) bf.onclick=async()=>{
     if(!await confirmBox('เลิกเชื่อมไฟล์','ข้อมูลในเครื่องยังอยู่ครบ เพียงแต่จะไม่เขียนลงไฟล์นั้นอีก','เลิกเชื่อม')) return;
     await fileForget(); S.fileSaved=false; toast('เลิกเชื่อมไฟล์แล้ว'); render(); };
@@ -2670,7 +2780,42 @@ function renderSetup(){
   };
 }
 
+/* ---------- แถบเตือนเมื่อไฟล์ร่วมถูกแก้จากเครื่องอื่น ---------- */
+function paintFileBar(){
+  const bar=$('#fileBar'); if(!bar) return;
+  if(!S.cfg){ bar.style.display='none'; return; }
+  if(S.db || !S.fileStale){
+    if(S.db || !S.fileNeedsPermission){ bar.style.display='none'; return; }
+    bar.style.display='flex';
+    bar.innerHTML=`<span><b>ยังไม่ได้อนุญาตให้เขียนไฟล์ข้อมูล</b> — การบันทึกจะเก็บไว้ในเครื่องนี้เท่านั้น</span>
+      <span class="sp"></span><button id="fbGrant">อนุญาตตอนนี้</button>`;
+    $('#fbGrant').onclick=async()=>{ if(await fileGrant()){ await persistLocal(); toast('อนุญาตแล้ว'); paintFileBar(); paintShell(); } };
+    return;
+  }
+  const st=S.fileStale;
+  bar.style.display='flex';
+  bar.innerHTML=`<span><b>ไฟล์ข้อมูลร่วมถูกแก้จากเครื่องอื่น</b> — บันทึกโดย ${esc(deviceLabel(st.savedBy))}
+      เมื่อ ${esc(thDate((st.savedAt||'').slice(0,10)))} ${esc((st.savedAt||'').slice(11,16))} น.
+      ข้อมูลที่เห็นอยู่บนหน้าจอนี้ยังเป็นชุดเก่า</span>
+    <span class="sp"></span>
+    <button id="fbReload">โหลดข้อมูลล่าสุดจากไฟล์</button>`;
+  $('#fbReload').onclick=async()=>{
+    if(S.batchDirty && !await confirmBox('โหลดข้อมูลใหม่','ข้อมูลที่ยังไม่ได้บันทึกในหน้านี้จะหายไป','โหลดใหม่')) return;
+    if(await reloadFromFile()){ toast('โหลดข้อมูลล่าสุดแล้ว'); paintShell(); paintFileBar(); render(); }
+  };
+}
+let FILE_TIMER=null;
+function startFileWatch(){
+  if(S.db) return;
+  const tick=async()=>{ try{ if(await fileHandle()){ await checkFileFresh(); paintFileBar(); } }catch(e){} };
+  window.addEventListener('focus', tick);
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) tick(); });
+  if(FILE_TIMER) clearInterval(FILE_TIMER);
+  FILE_TIMER=setInterval(tick, 45000);
+}
+
 function paintShell(){
+  if(!S.cfg || !$('#brandName')) return;
   $('#brandName').textContent = 'โรงเรียน'+(S.cfg.school.name||'');
   $('#brandFY').textContent   = 'ปีงบประมาณ พ.ศ. '+S.cfg.fy + (S.cfg.closed?' · ปิดบัญชีแล้ว':'');
   const ys=$('#yearSel');
@@ -2705,6 +2850,7 @@ function paintShell(){
     return;
   }
   paintShell();
+  startFileWatch();
   window.addEventListener('hashchange',render);
   render();
 })();
